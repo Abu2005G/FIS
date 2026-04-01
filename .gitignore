@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
+
+# SQLite / local DB
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# Pytest / cache
+.pytest_cache/
+.mypy_cache/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
