@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(curl:*)",
+      "Bash(ollama serve:*)",
+      "Bash(ollama pull:*)",
+      "Bash(pip install:*)",
+      "Bash(/Users/abdulvaseemmasood/FIS/venv/bin/python:*)",
+      "Bash(PYTHONPATH=/Users/abdulvaseemmasood/FIS /Users/abdulvaseemmasood/FIS/venv/bin/python:*)"
+    ]
+  }
+}

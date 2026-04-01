@@ -1,0 +1,12 @@
+{
+    "site_package_search_strategy": "pep561",
+    "source_directories": [
+        "/Users/abdulvaseemmasood/FIS"
+    ],
+    "search_path": [
+        "/Users/abdulvaseemmasood/FIS",
+        "/Users/abdulvaseemmasood/FIS/.venv/lib/python3.11/site-packages"
+    ],
+    "python_version": "3.11",
+    "strict": false
+}
