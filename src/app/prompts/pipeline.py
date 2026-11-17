@@ -1,437 +1,446 @@
 """
-Financial Intelligence Pipeline Executor
-Implements the 5-stage LLM reasoning pipeline from README
+5-stage LLM pipeline: structuring -> classification -> behaviour -> risk -> summary.
+
+The pipeline is advisory. It produces analysis and a recommendation that
+``src.app.decision`` weighs against the deterministic scorecard.
+
+Guarantees
+----------
+* No shared state: every run keeps its data in local variables, so one
+  pipeline object is safe to use from many request threads.
+* Every model reply is validated against a schema before it is used.
+* A failed stage is recorded as failed. It never turns into a silent
+  rejection or approval.
+* The audit record holds what actually happened (status, timing, call counts,
+  errors), not estimated confidence figures.
 """
 
-import json
-import time
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, field
-from datetime import datetime
-import os
+from __future__ import annotations
 
+import json
+import logging
+import re
+import time
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar
+
+from pydantic import BaseModel, ValidationError
+
+from src.app.prompts.llm_client import LLMClient, LLMError
+from src.app.prompts.schemas import (
+    UNKNOWN_CATEGORY,
+    BehaviourAnalysis,
+    ClassificationOutput,
+    IntelligenceSummary,
+    RiskDetection,
+    StructuringOutput,
+)
 from src.app.prompts.templates import (
-    TRANSACTION_STRUCTURING_PROMPT,
-    TRANSACTION_CLASSIFICATION_PROMPT,
-    FINANCIAL_BEHAVIOUR_PROMPT,
-    RISK_DETECTION_PROMPT,
-    INTELLIGENCE_SUMMARY_PROMPT,
-    STRUCTURING_SYSTEM_PROMPT,
-    CLASSIFICATION_SYSTEM_PROMPT,
     BEHAVIOUR_ANALYSIS_SYSTEM_PROMPT,
-    RISK_DETECTION_SYSTEM_PROMPT,
+    CLASSIFICATION_SYSTEM_PROMPT,
+    FINANCIAL_BEHAVIOUR_PROMPT,
+    INTELLIGENCE_SUMMARY_PROMPT,
     INTELLIGENCE_SYSTEM_PROMPT,
+    RISK_DETECTION_PROMPT,
+    RISK_DETECTION_SYSTEM_PROMPT,
+    STRUCTURING_SYSTEM_PROMPT,
+    TRANSACTION_CLASSIFICATION_PROMPT,
+    TRANSACTION_STRUCTURING_PROMPT,
 )
 
+logger = logging.getLogger(__name__)
+
+PIPELINE_VERSION = "pipeline-2.0"
+
+OK = "ok"
+DEGRADED = "degraded"
+FAILED = "failed"
+SKIPPED = "skipped"
+
+VALIDATION_ATTEMPTS = 2
+BEHAVIOUR_SAMPLE_SIZE = 60
+DESCRIPTION_LIMIT = 80
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
 
 @dataclass
-class PipelineStage:
-    """Record of a pipeline stage execution"""
+class StageRecord:
+    """What happened in one pipeline stage."""
 
     stage_name: str
-    input_data: Any
-    output_data: Any
-    confidence: float
-    execution_time_ms: float
-    timestamp: str
+    status: str
+    started_at: str
+    execution_time_ms: float = 0.0
+    llm_calls: int = 0
     error: Optional[str] = None
+    detail: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class AuditLog:
-    """Complete audit trail for a loan decision"""
+class PipelineResult:
+    """Outcome of one pipeline run."""
 
-    application_id: int
-    applicant_name: str
-    loan_amount: float
-    stages: List[PipelineStage] = field(default_factory=list)
-    final_decision: Optional[Dict] = None
-    overall_confidence: float = 0.0
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    status: str  # "completed" or "failed"
+    provider: str
+    model: str
+    transactions_total: int
+    transactions_analysed: int
+    stages: List[StageRecord] = field(default_factory=list)
+    behaviour: Optional[Dict[str, Any]] = None
+    risk: Optional[Dict[str, Any]] = None
+    summary: Optional[Dict[str, Any]] = None
+    errors: List[str] = field(default_factory=list)
+    pipeline_version: str = PIPELINE_VERSION
+
+    @property
+    def completed(self) -> bool:
+        return self.status == "completed"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
-class LLMClient:
-    """Wrapper for LLM API calls - supports multiple backends"""
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    def __init__(self, provider: str = "ollama", model: Optional[str] = None):
-        self.provider = provider
-        self.model = model or self._get_default_model()
-        self.api_key = os.getenv("OPENAI_API_KEY") if provider == "openai" else None
 
-    def _get_default_model(self) -> str:
-        if self.provider == "ollama":
-            return "llama3.2"  # or mistral, phi4
-        elif self.provider == "openai":
-            return "gpt-4o-mini"
-        return "default"
+def _safe_text(value: Any, limit: int = DESCRIPTION_LIMIT) -> str:
+    """Neutralise statement text before it goes into a prompt."""
+    text = re.sub(r"[\x00-\x1f\x7f<>{}`]", " ", str(value or ""))
+    return re.sub(r"\s+", " ", text).strip()[:limit]
 
-    def call(
-        self, prompt: str, system_prompt: str = "", temperature: float = 0.2
-    ) -> Dict[str, Any]:
-        """Call LLM and return parsed response"""
-        if self.provider == "ollama":
-            return self._call_ollama(prompt, system_prompt, temperature)
-        elif self.provider == "openai":
-            return self._call_openai(prompt, system_prompt, temperature)
-        else:
-            return self._call_mock(prompt, system_prompt)
 
-    def _call_ollama(
-        self, prompt: str, system_prompt: str, temperature: float
-    ) -> Dict[str, Any]:
-        """Call Ollama local LLM"""
-        try:
-            import requests  # type: ignore[import-untyped]
+def _compact(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
 
-            response = requests.post(
-                url="http://localhost:11434/api/generate",
-                json={
-                    "model": "llama3:latest",
-                    "prompt": f"{system_prompt}\n\n{prompt}",
-                    "stream": False,
-                    "options": {"temperature": temperature},
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=60,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return self._parse_response(result.get("response", ""))
-        except Exception as e:
-            return {"error": str(e), "raw_response": ""}
 
-    def _call_openai(
-        self, prompt: str, system_prompt: str, temperature: float
-    ) -> Dict[str, Any]:
-        """Call OpenAI API"""
-        try:
-            from openai import OpenAI  # type: ignore[import-untyped]
-
-            client = OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=temperature,
-            )
-            return self._parse_response(response.choices[0].message.content)
-        except Exception as e:
-            return {"error": str(e), "raw_response": ""}
-
-    def _call_mock(self, prompt: str, system_prompt: str) -> Dict[str, Any]:
-        """Mock LLM for testing - returns sensible defaults"""
-        return {
-            "mock": True,
-            "message": "Mock LLM response - configure Ollama or OpenAI for real inference",
-        }
-
-    def _parse_response(self, text: str) -> Dict[str, Any]:
-        """Extract JSON from LLM response text"""
-        # Try to find JSON in the response
-        try:
-            # Look for JSON block
-            if "```json" in text:
-                json_str = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                json_str = text.split("```")[1].split("```")[0].strip()
-            else:
-                json_str = text.strip()
-
-            return json.loads(json_str)
-        except:
-            # Return raw text if JSON parsing fails
-            return {"raw_response": text, "parsed": False}
+class _StageFailure(Exception):
+    """A stage could not produce a valid result."""
 
 
 class FinancialIntelligencePipeline:
-    """
-    5-Stage LLM Pipeline for Credit Risk Assessment
+    """Runs the five LLM stages for one application."""
 
-    Stage 1: Structuring -> Stage 2: Classification ->
-    Stage 3: Behaviour -> Stage 4: Risk -> Stage 5: Intelligence
-    """
+    def __init__(self, client: LLMClient, batch_size: int = 25, max_transactions: int = 150):
+        self.client = client
+        self.batch_size = max(1, batch_size)
+        self.max_transactions = max(1, max_transactions)
 
-    def __init__(self, llm_provider: str = "ollama", llm_model: Optional[str] = None):
-        self.llm = LLMClient(provider=llm_provider, model=llm_model)
-        self.audit_log: Optional[AuditLog] = None
+    # ------------------------------------------------------------- helpers
+    def _ask(
+        self, stage: str, system_prompt: str, prompt: str, schema: Type[SchemaT], calls: List[int]
+    ) -> SchemaT:
+        """Call the model and validate its reply, retrying once on bad output."""
+        last_error = "no attempt made"
+        for _ in range(VALIDATION_ATTEMPTS):
+            calls[0] += 1
+            try:
+                raw = self.client.complete_json(stage, system_prompt, prompt)
+            except LLMError as exc:
+                raise _StageFailure(str(exc)) from exc
+            try:
+                return schema.model_validate(raw)
+            except ValidationError as exc:
+                problems = "; ".join(
+                    f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+                    for error in exc.errors()[:3]
+                )
+                last_error = f"Model output failed validation ({problems})"
+                logger.warning("Stage %s: %s", stage, last_error)
+        raise _StageFailure(last_error)
 
-    def process_application(
+    def _batches(self, items: Sequence[Dict[str, Any]]) -> List[Sequence[Dict[str, Any]]]:
+        return [items[i : i + self.batch_size] for i in range(0, len(items), self.batch_size)]
+
+    # --------------------------------------------------------------- stages
+    def _structure(self, working: List[Dict[str, Any]]) -> StageRecord:
+        record = StageRecord("transaction_structuring", OK, _now())
+        started = time.perf_counter()
+        calls = [0]
+        failed_batches = mismatches = structured = 0
+        errors: List[str] = []
+
+        attempted = 0
+        for batch in self._batches(working):
+            attempted += 1
+            payload = [
+                {
+                    "index": txn["index"],
+                    "text": f"{txn['date']} {txn['description']}",
+                    "amount": txn["amount"],
+                    "type": txn["type"],
+                }
+                for txn in batch
+            ]
+            prompt = TRANSACTION_STRUCTURING_PROMPT.format(transactions_json=_compact(payload))
+            try:
+                output = self._ask(
+                    record.stage_name, STRUCTURING_SYSTEM_PROMPT, prompt, StructuringOutput, calls
+                )
+            except _StageFailure as exc:
+                failed_batches += 1
+                errors.append(str(exc))
+                if failed_batches == attempted:
+                    break  # nothing has worked yet: do not keep calling a dead backend
+                continue
+
+            by_index = {txn["index"]: txn for txn in batch}
+            for item in output.transactions:
+                target = by_index.get(item.index)
+                if target is None or "merchant" in target:
+                    continue
+                target["merchant"] = _safe_text(item.merchant, 60)
+                structured += 1
+                # The parser's amount and direction are authoritative. Count
+                # disagreements as a measure of how far to trust the model.
+                if (
+                    abs(item.amount - target["amount"]) > 0.01
+                    or item.transaction_type != target["type"]
+                ):
+                    mismatches += 1
+
+        for txn in working:
+            txn.setdefault("merchant", txn["description"][:60] or "Unknown")
+
+        total_batches = len(self._batches(working))
+        record.execution_time_ms = round((time.perf_counter() - started) * 1000, 1)
+        record.llm_calls = calls[0]
+        record.detail = {
+            "transactions": len(working),
+            "structured_by_model": structured,
+            "batches": total_batches,
+            "failed_batches": failed_batches,
+            "model_disagreements": mismatches,
+        }
+        if failed_batches == attempted:
+            record.status, record.error = FAILED, errors[0]
+        elif failed_batches or structured < len(working):
+            record.status = DEGRADED
+            record.error = errors[0] if errors else "Model skipped some transactions"
+        return record
+
+    def _classify(self, working: List[Dict[str, Any]]) -> StageRecord:
+        record = StageRecord("transaction_classification", OK, _now())
+        started = time.perf_counter()
+        calls = [0]
+        failed_batches = classified = 0
+        errors: List[str] = []
+
+        attempted = 0
+        for batch in self._batches(working):
+            attempted += 1
+            payload = [
+                {
+                    "index": txn["index"],
+                    "merchant": txn["merchant"],
+                    "amount": txn["amount"],
+                    "type": txn["type"],
+                }
+                for txn in batch
+            ]
+            prompt = TRANSACTION_CLASSIFICATION_PROMPT.format(transactions_json=_compact(payload))
+            try:
+                output = self._ask(
+                    record.stage_name,
+                    CLASSIFICATION_SYSTEM_PROMPT,
+                    prompt,
+                    ClassificationOutput,
+                    calls,
+                )
+            except _StageFailure as exc:
+                failed_batches += 1
+                errors.append(str(exc))
+                if failed_batches == attempted:
+                    break  # nothing has worked yet: do not keep calling a dead backend
+                continue
+
+            by_index = {txn["index"]: txn for txn in batch}
+            for item in output.transactions:
+                target = by_index.get(item.index)
+                if target is None or "category" in target:
+                    continue
+                target["category"] = item.category
+                target["merchant_type"] = _safe_text(item.merchant_type, 40)
+                target["confidence"] = item.confidence
+                classified += 1
+
+        for txn in working:
+            txn.setdefault("category", UNKNOWN_CATEGORY)
+
+        total_batches = len(self._batches(working))
+        confidences = [txn["confidence"] for txn in working if "confidence" in txn]
+        record.execution_time_ms = round((time.perf_counter() - started) * 1000, 1)
+        record.llm_calls = calls[0]
+        record.detail = {
+            "transactions": len(working),
+            "classified_by_model": classified,
+            "batches": total_batches,
+            "failed_batches": failed_batches,
+            "mean_model_confidence": (
+                round(sum(confidences) / len(confidences), 3) if confidences else None
+            ),
+        }
+        if failed_batches == attempted:
+            record.status, record.error = FAILED, errors[0]
+        elif failed_batches or classified < len(working):
+            record.status = DEGRADED
+            record.error = errors[0] if errors else "Model skipped some transactions"
+        return record
+
+    def _single(
         self,
-        application_id: int,
-        applicant_name: str,
+        stage_name: str,
+        system_prompt: str,
+        prompt: str,
+        schema: Type[SchemaT],
+    ) -> tuple:
+        record = StageRecord(stage_name, OK, _now())
+        started = time.perf_counter()
+        calls = [0]
+        output: Optional[SchemaT] = None
+        try:
+            output = self._ask(stage_name, system_prompt, prompt, schema, calls)
+        except _StageFailure as exc:
+            record.status, record.error = FAILED, str(exc)
+        record.execution_time_ms = round((time.perf_counter() - started) * 1000, 1)
+        record.llm_calls = calls[0]
+        return record, output
+
+    # ------------------------------------------------------------------ run
+    def run(
+        self,
+        transactions: Sequence[Dict[str, Any]],
+        features: Dict[str, Any],
+        scorecard: Dict[str, Any],
         loan_amount: float,
+        loan_term_months: int,
         loan_purpose: str,
-        raw_transactions: List[str],
-    ) -> Dict[str, Any]:
+    ) -> PipelineResult:
         """
-        Run the complete 5-stage pipeline
+        Run all five stages.
 
         Args:
-            application_id: Unique ID for the loan application
-            applicant_name: Name of applicant
-            loan_amount: Requested loan amount
-            loan_purpose: Purpose of loan
-            raw_transactions: List of raw transaction strings from PDF
-
-        Returns:
-            Final credit decision with complete audit trail
+            transactions: Normalised transactions, oldest first.
+            features: Deterministic features computed from the full statement.
+            scorecard: Scorecard result (recommendation, score, red flags).
+            loan_amount, loan_term_months, loan_purpose: The request.
         """
-        # Initialize audit log
-        self.audit_log = AuditLog(
-            application_id=application_id,
-            applicant_name=applicant_name,
-            loan_amount=loan_amount,
-        )
-        assert self.audit_log is not None  # Set above; used for full pipeline run
-        print(f"Processing Application #{application_id} for {applicant_name}")
-        print(f"Loan Amount: ${loan_amount:,.2f}")
-        print(f"{'=' * 60}")
-
-        # Stage 1: Transaction Structuring
-        structured_transactions = self._stage_1_structure(raw_transactions)
-
-        # Stage 2: Transaction Classification
-        classified_transactions = self._stage_2_classify(structured_transactions)
-
-        # Stage 3: Financial Behaviour Analysis
-        behaviour_analysis = self._stage_3_analyze_behaviour(classified_transactions)
-
-        # Stage 4: Risk Detection
-        risk_assessment = self._stage_4_detect_risk(behaviour_analysis, loan_amount)
-
-        # Stage 5: Intelligence Summary & Decision
-        final_decision = self._stage_5_summarize(
-            classified_transactions,
-            behaviour_analysis,
-            risk_assessment,
-            loan_amount,
-            loan_purpose,
-            applicant_name,
-        )
-
-        # Calculate overall confidence
-        confidences = [s.confidence for s in self.audit_log.stages]
-        self.audit_log.overall_confidence = (
-            sum(confidences) / len(confidences) if confidences else 0
-        )
-        self.audit_log.final_decision = final_decision
-
-        return {
-            "decision": final_decision,
-            "audit_log": self._audit_log_to_dict(self.audit_log),
-            "processing_summary": {
-                "transactions_processed": len(raw_transactions),
-                "stages_completed": len(self.audit_log.stages),
-                "overall_confidence": self.audit_log.overall_confidence,
-                "processing_time_ms": sum(
-                    s.execution_time_ms for s in self.audit_log.stages
-                ),
-            },
-        }
-
-    def _stage_1_structure(self, raw_transactions: List[str]) -> List[Dict]:
-        """Stage 1: Structure raw transactions"""
-        assert self.audit_log is not None
-        print("\n📋 Stage 1: Transaction Structuring...")
-        start_time = time.time()
-
-        structured = []
-        for i, txn_text in enumerate(
-            raw_transactions[:20]
-        ):  # Process first 20 for speed
-            prompt = TRANSACTION_STRUCTURING_PROMPT.format(transaction_text=txn_text)
-            result = self.llm.call(prompt, STRUCTURING_SYSTEM_PROMPT)
-
-            if "error" not in result:
-                result["raw_text"] = txn_text
-                structured.append(result)
-
-        execution_time = (time.time() - start_time) * 1000
-
-        self.audit_log.stages.append(
-            PipelineStage(
-                stage_name="transaction_structuring",
-                input_data=raw_transactions[:10],
-                output_data=structured,
-                confidence=0.85,  # Estimated
-                execution_time_ms=execution_time,
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-        print(f"   ✓ Structured {len(structured)} transactions")
-        return structured
-
-    def _stage_2_classify(self, structured_transactions: List[Dict]) -> List[Dict]:
-        """Stage 2: Classify transactions"""
-        assert self.audit_log is not None
-        print("\n🏷️  Stage 2: Transaction Classification...")
-        start_time = time.time()
-
-        classified = []
-        for txn in structured_transactions:
-            prompt = TRANSACTION_CLASSIFICATION_PROMPT.format(
-                structured_transaction=json.dumps(txn)
-            )
-            result = self.llm.call(prompt, CLASSIFICATION_SYSTEM_PROMPT)
-
-            # Merge classification with structured data
-            txn_with_class = {**txn, **result}
-            classified.append(txn_with_class)
-
-        execution_time = (time.time() - start_time) * 1000
-
-        self.audit_log.stages.append(
-            PipelineStage(
-                stage_name="transaction_classification",
-                input_data=structured_transactions,
-                output_data=classified,
-                confidence=0.80,
-                execution_time_ms=execution_time,
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-        print(f"   ✓ Classified {len(classified)} transactions")
-        return classified
-
-    def _stage_3_analyze_behaviour(self, classified_transactions: List[Dict]) -> Dict:
-        """Stage 3: Financial Behaviour Analysis"""
-        assert self.audit_log is not None
-        print("\n📊 Stage 3: Financial Behaviour Analysis...")
-        start_time = time.time()
-
-        # Sample transactions for analysis (first 15)
-        txn_sample = classified_transactions[:15]
-
-        prompt = FINANCIAL_BEHAVIOUR_PROMPT.format(
-            transaction_list=json.dumps(txn_sample, indent=2)
-        )
-        result = self.llm.call(
-            prompt, BEHAVIOUR_ANALYSIS_SYSTEM_PROMPT, temperature=0.3
-        )
-
-        execution_time = (time.time() - start_time) * 1000
-
-        self.audit_log.stages.append(
-            PipelineStage(
-                stage_name="behaviour_analysis",
-                input_data=txn_sample,
-                output_data=result,
-                confidence=0.75,
-                execution_time_ms=execution_time,
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-        print(f"   ✓ Analysis complete")
-        return result
-
-    def _stage_4_detect_risk(
-        self, behaviour_analysis: Dict, loan_amount: float
-    ) -> Dict:
-        """Stage 4: Risk Signal Detection"""
-        assert self.audit_log is not None
-        print("\n⚠️  Stage 4: Risk Signal Detection...")
-        start_time = time.time()
-
-        prompt = RISK_DETECTION_PROMPT.format(
-            behaviour_analysis=json.dumps(behaviour_analysis, indent=2),
-            loan_amount=loan_amount,
-        )
-        result = self.llm.call(prompt, RISK_DETECTION_SYSTEM_PROMPT, temperature=0.2)
-
-        execution_time = (time.time() - start_time) * 1000
-
-        self.audit_log.stages.append(
-            PipelineStage(
-                stage_name="risk_detection",
-                input_data=behaviour_analysis,
-                output_data=result,
-                confidence=result.get("risk_score", 0.5),
-                execution_time_ms=execution_time,
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-        risk_level = result.get("risk_level", "unknown")
-        print(f"   ✓ Risk Level: {risk_level.upper()}")
-        return result
-
-    def _stage_5_summarize(
-        self,
-        transactions: List[Dict],
-        behaviour_analysis: Dict,
-        risk_assessment: Dict,
-        loan_amount: float,
-        loan_purpose: str,
-        applicant_name: str,
-    ) -> Dict:
-        """Stage 5: Final Intelligence Summary"""
-        assert self.audit_log is not None
-        print("\n🎯 Stage 5: Financial Intelligence Summary...")
-        start_time = time.time()
-
-        prompt = INTELLIGENCE_SUMMARY_PROMPT.format(
-            transaction_summary=json.dumps(transactions[:10], indent=2),
-            behaviour_analysis=json.dumps(behaviour_analysis, indent=2),
-            risk_assessment=json.dumps(risk_assessment, indent=2),
-            loan_amount=loan_amount,
-            loan_purpose=loan_purpose,
-            applicant_name=applicant_name,
-        )
-        result = self.llm.call(prompt, INTELLIGENCE_SYSTEM_PROMPT, temperature=0.2)
-
-        execution_time = (time.time() - start_time) * 1000
-
-        self.audit_log.stages.append(
-            PipelineStage(
-                stage_name="intelligence_summary",
-                input_data={"behaviour": behaviour_analysis, "risk": risk_assessment},
-                output_data=result,
-                confidence=result.get("credit_decision", {}).get("confidence", 0.5),
-                execution_time_ms=execution_time,
-                timestamp=datetime.utcnow().isoformat(),
-            )
-        )
-
-        approved = result.get("credit_decision", {}).get("approved", False)
-        print(f"   ✓ Decision: {'APPROVED' if approved else 'REJECTED'}")
-        return result
-
-    def _audit_log_to_dict(self, audit_log: AuditLog) -> Dict:
-        """Convert audit log to dictionary"""
-        return {
-            "application_id": audit_log.application_id,
-            "applicant_name": audit_log.applicant_name,
-            "loan_amount": audit_log.loan_amount,
-            "created_at": audit_log.created_at,
-            "overall_confidence": audit_log.overall_confidence,
-            "stages": [
+        recent = list(transactions)[-self.max_transactions :]
+        working: List[Dict[str, Any]] = []
+        for index, txn in enumerate(recent):
+            deposit = txn.get("deposit") or 0.0
+            working.append(
                 {
-                    "stage_name": s.stage_name,
-                    "confidence": s.confidence,
-                    "execution_time_ms": s.execution_time_ms,
-                    "timestamp": s.timestamp,
-                    "error": s.error,
+                    "index": index,
+                    "date": str(txn.get("date", "")),
+                    "description": _safe_text(txn.get("description")),
+                    "amount": round(float(deposit or txn.get("withdrawal") or 0.0), 2),
+                    "type": "credit" if deposit else "debit",
                 }
-                for s in audit_log.stages
-            ],
-            "final_decision": audit_log.final_decision,
-        }
+            )
 
+        result = PipelineResult(
+            status="failed",
+            provider=self.client.provider,
+            model=self.client.model,
+            transactions_total=len(transactions),
+            transactions_analysed=len(working),
+        )
+        remaining = [
+            "transaction_structuring",
+            "transaction_classification",
+            "behaviour_analysis",
+            "risk_detection",
+            "intelligence_summary",
+        ]
 
-# Global pipeline instance
-_pipeline_instance = None
+        def finish(record: StageRecord) -> bool:
+            result.stages.append(record)
+            remaining.remove(record.stage_name)
+            if record.error:
+                result.errors.append(f"{record.stage_name}: {record.error}")
+            if record.status == FAILED:
+                for name in remaining:
+                    result.stages.append(StageRecord(name, SKIPPED, _now()))
+                return False
+            return True
 
+        if not working:
+            finish(StageRecord(remaining[0], FAILED, _now(), error="No transactions to analyse"))
+            return result
 
-def get_pipeline(
-    llm_provider: str = "ollama", llm_model: Optional[str] = None
-) -> FinancialIntelligencePipeline:
-    """Get or create pipeline instance"""
-    global _pipeline_instance
-    if _pipeline_instance is None:
-        _pipeline_instance = FinancialIntelligencePipeline(llm_provider, llm_model)
-    return _pipeline_instance
+        if not finish(self._structure(working)):
+            return result
+        if not finish(self._classify(working)):
+            return result
+
+        totals: Dict[str, Dict[str, float]] = defaultdict(lambda: {"count": 0, "total": 0.0})
+        for txn in working:
+            bucket = totals[txn["category"]]
+            bucket["count"] += 1
+            bucket["total"] = round(bucket["total"] + txn["amount"], 2)
+
+        sample = [
+            {
+                "date": txn["date"],
+                "merchant": txn["merchant"],
+                "amount": txn["amount"],
+                "type": txn["type"],
+                "category": txn["category"],
+            }
+            for txn in working[-BEHAVIOUR_SAMPLE_SIZE:]
+        ]
+        features_json = _compact(features)
+
+        record, behaviour = self._single(
+            "behaviour_analysis",
+            BEHAVIOUR_ANALYSIS_SYSTEM_PROMPT,
+            FINANCIAL_BEHAVIOUR_PROMPT.format(
+                features_json=features_json,
+                category_totals_json=_compact(totals),
+                transactions_json=_compact(sample),
+            ),
+            BehaviourAnalysis,
+        )
+        if not finish(record) or behaviour is None:
+            return result
+        result.behaviour = behaviour.model_dump()
+        behaviour_json = _compact(result.behaviour)
+
+        record, risk = self._single(
+            "risk_detection",
+            RISK_DETECTION_SYSTEM_PROMPT,
+            RISK_DETECTION_PROMPT.format(
+                loan_amount=f"{loan_amount:,.2f}",
+                loan_term_months=loan_term_months,
+                behaviour_json=behaviour_json,
+                features_json=features_json,
+            ),
+            RiskDetection,
+        )
+        if not finish(record) or risk is None:
+            return result
+        result.risk = risk.model_dump()
+
+        record, summary = self._single(
+            "intelligence_summary",
+            INTELLIGENCE_SYSTEM_PROMPT,
+            INTELLIGENCE_SUMMARY_PROMPT.format(
+                loan_amount=f"{loan_amount:,.2f}",
+                loan_term_months=loan_term_months,
+                loan_purpose=_safe_text(loan_purpose, 100) or "Not stated",
+                behaviour_json=behaviour_json,
+                risk_json=_compact(result.risk),
+                scorecard_json=_compact(scorecard),
+            ),
+            IntelligenceSummary,
+        )
+        if not finish(record) or summary is None:
+            return result
+        result.summary = summary.model_dump()
+        result.summary["supports_approval"] = summary.supports_approval
+        result.status = "completed"
+        return result

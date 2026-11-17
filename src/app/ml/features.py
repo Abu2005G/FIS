@@ -1,269 +1,342 @@
 """
-Feature extraction from financial transactions for credit risk assessment.
+Feature extraction from bank transactions for credit risk assessment.
+
+Input is the normalised transaction list produced by
+``src.app.ml.statement_parser``. All ratios are unit-free, so the features work
+for any currency.
 """
+
+from __future__ import annotations
+
 import re
-import json
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+import statistics
 from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import date
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from src.app.ml.statement_parser import parse_date, to_number
+
+DAYS_PER_MONTH = 30.4375
+
+_SALARY = re.compile(r"salary|payroll|wages?\b|stipend", re.IGNORECASE)
+_BENEFIT = re.compile(r"pension|benefit|annuity|social\s*security", re.IGNORECASE)
+_TRANSFER = re.compile(r"transfer|neft|imps|rtgs|upi|tpt", re.IGNORECASE)
+_CASH_IN = re.compile(r"cash\s*dep|cash\s*deposit", re.IGNORECASE)
+
+# Money in that is not earned income
+_NOT_INCOME = re.compile(
+    r"refund|reversal|\brev\b|cashback|charge\s*back|loan\s*disb|disbursement"
+    r"|interest\s*(credit|paid|pd)|int\.?\s*pd",
+    re.IGNORECASE,
+)
+
+_ESSENTIAL = re.compile(
+    r"rent\b|mortgage|utilit|electric|water\s*bill|\bgas\b|grocer|supermarket|food"
+    r"|transport|fuel|petrol|medical|pharmacy|hospital|insurance|school|tuition"
+    r"|household",
+    re.IGNORECASE,
+)
+
+_DEBT = re.compile(
+    r"\bloan\b|\bemi\b|mortgage|repayment|credit\s*card|\bcc\s*payment|instal?ment",
+    re.IGNORECASE,
+)
+
+_CASH_OUT = re.compile(
+    r"\batm\b|cash\s*withdraw|cash\s*wdl|\bcwdr\b|\bnwd\b|\bawb\b|card\s*withdraw",
+    re.IGNORECASE,
+)
+
+_GAMBLING = re.compile(
+    r"casino|gambl|betting|\bbet365|betway|dream11|my11circle|rummy|poker|lottery"
+    r"|winzo|\bmpl\b|sportsbook|\bstake\b",
+    re.IGNORECASE,
+)
+
+_RETURNED = re.compile(
+    r"(chq|cheque|ecs|ach|nach|emi|payment)\s*(ret|rtn|return|bounce)"
+    r"|bounce|dishono|insufficient\s*fund|penal|sanction\s*interest"
+    r"|overdraft\s*(fee|charge|interest)|\bod\s*(fee|charge|interest)",
+    re.IGNORECASE,
+)
 
 
-@dataclass
-class Transaction:
-    date: str
-    description: str
-    withdrawal: Optional[float]
-    deposit: Optional[float]
-    balance: Optional[float]
-
-
-@dataclass
+@dataclass(frozen=True)
 class FinancialFeatures:
-    """Extracted features for ML model"""
-    # Income features
-    total_income_3m: float
+    """Summary of an applicant's account behaviour."""
+
+    # History
+    transaction_count: int
+    history_days: int
+    months_covered: float
+
+    # Income
+    total_income: float
     avg_monthly_income: float
-    income_stability: float  # coefficient of variation
+    income_stability: Optional[float]  # 0..1, higher is steadier; None if too little history
     income_sources: int
 
-    # Expense features
-    total_expenses_3m: float
+    # Spending
+    total_expenses: float
     avg_monthly_expense: float
     essential_expense_ratio: float
-
-    # Balance features
-    avg_balance: float
-    min_balance: float
-    max_balance: float
-    balance_trend: float  # slope of balance over time
-    negative_balance_count: int
-
-    # Transaction patterns
-    transaction_count: int
     avg_transaction_size: float
-    large_transactions: int  # > 50% of avg income
-    frequent_small_deposits: int  # possible structuring
+    large_transactions: int
 
-    # Ratios
+    # Balances (None when the statement carries no running balance)
+    avg_balance: Optional[float]
+    min_balance: Optional[float]
+    max_balance: Optional[float]
+    balance_trend: Optional[float]  # monthly balance change as a share of monthly income
+    negative_balance_days: int
+
+    # Obligations and ratios
+    monthly_debt_payments: float
     debt_to_income: float
     savings_rate: float
     expense_to_income: float
 
-    # Derived score components
-    creditworthiness_score: float
+    # Behavioural signals
+    cash_withdrawal_ratio: float
+    gambling_transactions: int
+    returned_payments: int
 
 
-def parse_amount(amount_str: str) -> Optional[float]:
-    """Parse amount string to float, handling commas."""
-    if amount_str is None or amount_str == "":
+@dataclass(frozen=True)
+class _Txn:
+    when: date
+    description: str
+    withdrawal: float
+    deposit: float
+    balance: Optional[float]
+
+
+def _prepare(transactions: Sequence[Dict[str, Any]]) -> List[_Txn]:
+    """Validate, convert and date-order raw transaction dicts."""
+    prepared: List[Tuple[date, int, _Txn]] = []
+    for index, raw in enumerate(transactions):
+        if not isinstance(raw, dict):
+            continue
+        when = parse_date(raw.get("date"))
+        if when is None:
+            continue
+        withdrawal = abs(to_number(raw.get("withdrawal")) or 0.0)
+        deposit = abs(to_number(raw.get("deposit")) or 0.0)
+        if withdrawal == 0.0 and deposit == 0.0:
+            continue
+        txn = _Txn(
+            when=when,
+            description=str(raw.get("description") or ""),
+            withdrawal=withdrawal,
+            deposit=deposit,
+            balance=to_number(raw.get("balance")),
+        )
+        prepared.append((when, index, txn))
+    # Stable sort: keeps the statement's own order within a day
+    prepared.sort(key=lambda item: (item[0], item[1]))
+    return [txn for _, _, txn in prepared]
+
+
+def _month_keys(first: date, last: date) -> List[Tuple[int, int]]:
+    keys = []
+    year, month = first.year, first.month
+    while (year, month) <= (last.year, last.month):
+        keys.append((year, month))
+        month += 1
+        if month > 12:
+            year, month = year + 1, 1
+    return keys
+
+
+def _income_stability(
+    income_by_month: Dict[Tuple[int, int], float], first: date, last: date
+) -> Optional[float]:
+    """1 minus the coefficient of variation of monthly income, floored at 0."""
+    keys = _month_keys(first, last)
+    # Drop partial months at the edges when enough full months remain
+    if len(keys) >= 4:
+        if first.day > 5:
+            keys = keys[1:]
+        if last.day < 25:
+            keys = keys[:-1]
+    if len(keys) < 2:
         return None
-    try:
-        return float(str(amount_str).replace(",", ""))
-    except (ValueError, TypeError):
-        return None
+    values = [income_by_month.get(key, 0.0) for key in keys]
+    mean = statistics.fmean(values)
+    if mean <= 0:
+        return 0.0
+    variation = statistics.pstdev(values) / mean
+    return round(max(0.0, 1.0 - min(variation, 1.0)), 4)
 
 
-def parse_date(date_str: str) -> Optional[datetime]:
-    """Parse date string to datetime object."""
-    try:
-        return datetime.strptime(date_str, "%d/%m/%y")
-    except ValueError:
-        try:
-            return datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            return None
+def _balance_statistics(
+    txns: Sequence[_Txn],
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], int]:
+    """Time-weighted average, extremes, monthly slope and days overdrawn."""
+    balances = [txn.balance for txn in txns if txn.balance is not None]
+    if not balances:
+        return None, None, None, None, 0
+
+    end_of_day: Dict[date, float] = {}
+    negative_days = set()
+    for txn in txns:
+        if txn.balance is None:
+            continue
+        end_of_day[txn.when] = txn.balance
+        if txn.balance < 0:
+            negative_days.add(txn.when)
+
+    days = sorted(end_of_day)
+    if len(days) == 1:
+        average = end_of_day[days[0]]
+        slope = None
+    else:
+        weighted = 0.0
+        for today, tomorrow in zip(days, days[1:], strict=False):
+            weighted += end_of_day[today] * (tomorrow - today).days
+        span = (days[-1] - days[0]).days
+        average = weighted / span if span else end_of_day[days[-1]]
+
+        xs = [(day - days[0]).days for day in days]
+        ys = [end_of_day[day] for day in days]
+        x_mean, y_mean = statistics.fmean(xs), statistics.fmean(ys)
+        denominator = sum((x - x_mean) ** 2 for x in xs)
+        slope = (
+            sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys, strict=True)) / denominator
+            if denominator
+            else None
+        )
+
+    return average, min(balances), max(balances), slope, len(negative_days)
 
 
-def extract_features_from_transactions(transactions: List[Dict[str, Any]]) -> FinancialFeatures:
+def empty_features() -> FinancialFeatures:
+    return FinancialFeatures(
+        transaction_count=0,
+        history_days=0,
+        months_covered=0.0,
+        total_income=0.0,
+        avg_monthly_income=0.0,
+        income_stability=None,
+        income_sources=0,
+        total_expenses=0.0,
+        avg_monthly_expense=0.0,
+        essential_expense_ratio=0.0,
+        avg_transaction_size=0.0,
+        large_transactions=0,
+        avg_balance=None,
+        min_balance=None,
+        max_balance=None,
+        balance_trend=None,
+        negative_balance_days=0,
+        monthly_debt_payments=0.0,
+        debt_to_income=0.0,
+        savings_rate=0.0,
+        expense_to_income=0.0,
+        cash_withdrawal_ratio=0.0,
+        gambling_transactions=0,
+        returned_payments=0,
+    )
+
+
+def extract_features_from_transactions(
+    transactions: Sequence[Dict[str, Any]],
+) -> FinancialFeatures:
     """
-    Extract ML features from a list of transactions.
+    Compute credit features from transactions.
 
     Args:
-        transactions: List of transaction dicts with date, description, withdrawal, deposit, balance
-
-    Returns:
-        FinancialFeatures object with computed features
+        transactions: Dicts with date, description, withdrawal, deposit, balance.
     """
-    if not transactions:
-        return FinancialFeatures(
-            total_income_3m=0, avg_monthly_income=0, income_stability=0, income_sources=0,
-            total_expenses_3m=0, avg_monthly_expense=0, essential_expense_ratio=0,
-            avg_balance=0, min_balance=0, max_balance=0, balance_trend=0, negative_balance_count=0,
-            transaction_count=0, avg_transaction_size=0, large_transactions=0, frequent_small_deposits=0,
-            debt_to_income=0, savings_rate=0, expense_to_income=0,
-            creditworthiness_score=0
-        )
+    txns = _prepare(transactions)
+    if not txns:
+        return empty_features()
 
-    # Parse transactions
-    parsed_txns = []
-    for t in transactions:
-        txn = Transaction(
-            date=t.get("date", ""),
-            description=t.get("description", ""),
-            withdrawal=parse_amount(t.get("withdrawal")),
-            deposit=parse_amount(t.get("deposit")),
-            balance=parse_amount(t.get("balance"))
-        )
-        parsed_txns.append(txn)
+    first, last = txns[0].when, txns[-1].when
+    history_days = (last - first).days + 1
+    months = max(1.0, history_days / DAYS_PER_MONTH)
 
-    # Sort by date
-    parsed_txns.sort(key=lambda x: x.date)
+    income_by_month: Dict[Tuple[int, int], float] = defaultdict(float)
+    income_sources = set()
+    total_income = total_expenses = 0.0
+    essential = debt = cash_out = 0.0
+    gambling = returned = 0
 
-    # Group by month
-    monthly_data = defaultdict(lambda: {"income": [], "expenses": []})
-    for txn in parsed_txns:
-        month_key = txn.date[:5] if len(txn.date) >= 5 else txn.date  # MM/YY
-        if txn.deposit:
-            monthly_data[month_key]["income"].append(txn.deposit)
-        if txn.withdrawal:
-            monthly_data[month_key]["expenses"].append(txn.withdrawal)
-
-    # Calculate monthly income
-    monthly_incomes = [sum(data["income"]) for data in monthly_data.values()]
-    monthly_expenses = [sum(data["expenses"]) for data in monthly_data.values()]
-
-    total_income = sum(monthly_incomes) if monthly_incomes else 0
-    total_expenses = sum(monthly_expenses) if monthly_expenses else 0
-    avg_monthly_income = total_income / len(monthly_incomes) if monthly_incomes else 0
-    avg_monthly_expense = total_expenses / len(monthly_expenses) if monthly_expenses else 0
-
-    # Income stability (coefficient of variation: std/mean)
-    if monthly_incomes and len(monthly_incomes) > 1 and avg_monthly_income > 0:
-        mean_income = avg_monthly_income
-        variance = sum((x - mean_income) ** 2 for x in monthly_incomes) / len(monthly_incomes)
-        std_income = variance ** 0.5
-        income_stability = 1 - min(std_income / mean_income, 1)  # Higher is more stable
-    else:
-        income_stability = 0.5 if monthly_incomes else 0
-
-    # Income sources (unique deposit descriptions)
-    income_descriptions = set()
-    for txn in parsed_txns:
-        if txn.deposit and txn.deposit > 100:  # Filter small deposits
-            desc = txn.description.lower()
-            # Categorize income sources
-            if any(keyword in desc for keyword in ["salary", "wage", "payroll"]):
-                income_descriptions.add("salary")
-            elif any(keyword in desc for keyword in ["transfer", "deposit"]):
-                income_descriptions.add("transfer")
+    for txn in txns:
+        text = txn.description
+        if txn.deposit and not _NOT_INCOME.search(text):
+            total_income += txn.deposit
+            income_by_month[(txn.when.year, txn.when.month)] += txn.deposit
+            if _SALARY.search(text):
+                income_sources.add("salary")
+            elif _BENEFIT.search(text):
+                income_sources.add("benefit")
+            elif _CASH_IN.search(text):
+                income_sources.add("cash")
+            elif _TRANSFER.search(text):
+                income_sources.add("transfer")
             else:
-                income_descriptions.add("other")
+                income_sources.add("other")
 
-    # Balance statistics
-    balances = [txn.balance for txn in parsed_txns if txn.balance is not None]
-    avg_balance = sum(balances) / len(balances) if balances else 0
-    min_balance = min(balances) if balances else 0
-    max_balance = max(balances) if balances else 0
-    negative_balance_count = sum(1 for b in balances if b < 0)
+        if txn.withdrawal:
+            total_expenses += txn.withdrawal
+            if _DEBT.search(text):
+                debt += txn.withdrawal
+            elif _ESSENTIAL.search(text):
+                essential += txn.withdrawal
+            if _CASH_OUT.search(text):
+                cash_out += txn.withdrawal
+            if _GAMBLING.search(text):
+                gambling += 1
 
-    # Balance trend (simple linear regression slope approximation)
-    if len(balances) >= 2:
-        n = len(balances)
-        x_vals = list(range(n))
-        x_mean = sum(x_vals) / n
-        y_mean = avg_balance
-        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_vals, balances))
-        denominator = sum((x - x_mean) ** 2 for x in x_vals)
-        balance_trend = numerator / denominator if denominator != 0 else 0
-    else:
-        balance_trend = 0
+        if _RETURNED.search(text):
+            returned += 1
 
-    # Transaction patterns
-    transaction_count = len(parsed_txns)
-    all_amounts = [txn.deposit or txn.withdrawal or 0 for txn in parsed_txns]
-    avg_transaction_size = sum(all_amounts) / len(all_amounts) if all_amounts else 0
+    avg_monthly_income = total_income / months
+    avg_monthly_expense = total_expenses / months
+    monthly_debt = debt / months
 
-    # Large transactions (> 50% of avg monthly income)
-    threshold = avg_monthly_income * 0.5 if avg_monthly_income > 0 else 10000
-    large_transactions = sum(
-        1 for txn in parsed_txns
-        if (txn.deposit and txn.deposit > threshold) or
-           (txn.withdrawal and txn.withdrawal > threshold)
-    )
+    average, lowest, highest, slope, negative_days = _balance_statistics(txns)
+    balance_trend: Optional[float] = None
+    if slope is not None:
+        scale = avg_monthly_income if avg_monthly_income > 0 else max(abs(average or 0.0), 1.0)
+        balance_trend = round(slope * DAYS_PER_MONTH / scale, 4)
 
-    # Frequent small deposits (possible structuring - deposits just under reporting threshold)
-    frequent_small_deposits = sum(
-        1 for txn in parsed_txns
-        if txn.deposit and 5000 < txn.deposit < 10000
-    )
-
-    # Expense categorization
-    essential_keywords = ["rent", "mortgage", "utilities", "electric", "water", "groceries", "food", "transport", "medical", "insurance"]
-    essential_expenses = sum(
-        txn.withdrawal for txn in parsed_txns
-        if txn.withdrawal and any(kw in txn.description.lower() for kw in essential_keywords)
-    )
-    essential_expense_ratio = essential_expenses / total_expenses if total_expenses > 0 else 0
-
-    # Ratios
-    expense_to_income = total_expenses / total_income if total_income > 0 else 1.0
-    savings_rate = (total_income - total_expenses) / total_income if total_income > 0 else 0
-
-    # Estimate debt-to-income from expense patterns
-    # Assume recurring large withdrawals are debt payments
-    debt_keywords = ["loan", "credit card", "emi", "repayment", "debt"]
-    debt_payments = sum(
-        txn.withdrawal for txn in parsed_txns
-        if txn.withdrawal and any(kw in txn.description.lower() for kw in debt_keywords)
-    )
-    debt_to_income = debt_payments / total_income if total_income > 0 else 0
-
-    # Calculate creditworthiness score (0-100)
-    score = 50  # Base score
-    score += income_stability * 20  # Up to 20 points for stable income
-    score -= negative_balance_count * 5  # Penalty for overdrafts
-    score += min(savings_rate * 30, 15)  # Up to 15 points for savings
-    score -= min(expense_to_income * 10, 10)  # Penalty for high expense ratio
-    score -= min(debt_to_income * 20, 15)  # Penalty for high debt
-    score += min(avg_balance / (avg_monthly_income + 1) * 10, 10)  # Points for maintaining balance
-    score = max(0, min(100, score))  # Clamp between 0-100
+    amounts = [txn.deposit or txn.withdrawal for txn in txns]
+    large_threshold = avg_monthly_income * 0.5
+    large = sum(1 for amount in amounts if large_threshold > 0 and amount > large_threshold)
 
     return FinancialFeatures(
-        total_income_3m=total_income,
-        avg_monthly_income=avg_monthly_income,
-        income_stability=income_stability,
-        income_sources=len(income_descriptions),
-        total_expenses_3m=total_expenses,
-        avg_monthly_expense=avg_monthly_expense,
-        essential_expense_ratio=essential_expense_ratio,
-        avg_balance=avg_balance,
-        min_balance=min_balance,
-        max_balance=max_balance,
+        transaction_count=len(txns),
+        history_days=history_days,
+        months_covered=round(months, 2),
+        total_income=round(total_income, 2),
+        avg_monthly_income=round(avg_monthly_income, 2),
+        income_stability=_income_stability(income_by_month, first, last),
+        income_sources=len(income_sources),
+        total_expenses=round(total_expenses, 2),
+        avg_monthly_expense=round(avg_monthly_expense, 2),
+        essential_expense_ratio=round(essential / total_expenses, 4) if total_expenses else 0.0,
+        avg_transaction_size=round(statistics.fmean(amounts), 2),
+        large_transactions=large,
+        avg_balance=round(average, 2) if average is not None else None,
+        min_balance=lowest,
+        max_balance=highest,
         balance_trend=balance_trend,
-        negative_balance_count=negative_balance_count,
-        transaction_count=transaction_count,
-        avg_transaction_size=avg_transaction_size,
-        large_transactions=large_transactions,
-        frequent_small_deposits=frequent_small_deposits,
-        debt_to_income=debt_to_income,
-        savings_rate=savings_rate,
-        expense_to_income=expense_to_income,
-        creditworthiness_score=round(score, 2)
+        negative_balance_days=negative_days,
+        monthly_debt_payments=round(monthly_debt, 2),
+        debt_to_income=round(debt / total_income, 4) if total_income else 0.0,
+        savings_rate=(
+            round((total_income - total_expenses) / total_income, 4) if total_income else 0.0
+        ),
+        expense_to_income=round(total_expenses / total_income, 4) if total_income else 0.0,
+        cash_withdrawal_ratio=round(cash_out / total_expenses, 4) if total_expenses else 0.0,
+        gambling_transactions=gambling,
+        returned_payments=returned,
     )
 
 
 def features_to_dict(features: FinancialFeatures) -> Dict[str, Any]:
-    """Convert FinancialFeatures to dictionary."""
-    return {
-        "total_income_3m": features.total_income_3m,
-        "avg_monthly_income": features.avg_monthly_income,
-        "income_stability": features.income_stability,
-        "income_sources": features.income_sources,
-        "total_expenses_3m": features.total_expenses_3m,
-        "avg_monthly_expense": features.avg_monthly_expense,
-        "essential_expense_ratio": features.essential_expense_ratio,
-        "avg_balance": features.avg_balance,
-        "min_balance": features.min_balance,
-        "max_balance": features.max_balance,
-        "balance_trend": features.balance_trend,
-        "negative_balance_count": features.negative_balance_count,
-        "transaction_count": features.transaction_count,
-        "avg_transaction_size": features.avg_transaction_size,
-        "large_transactions": features.large_transactions,
-        "frequent_small_deposits": features.frequent_small_deposits,
-        "debt_to_income": features.debt_to_income,
-        "savings_rate": features.savings_rate,
-        "expense_to_income": features.expense_to_income,
-        "creditworthiness_score": features.creditworthiness_score
-    }
+    """Convert FinancialFeatures to a plain dictionary."""
+    return asdict(features)

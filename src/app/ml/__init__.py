@@ -1,1 +1,1 @@
-# ML module for credit risk assessment
+"""Statement parsing, feature extraction and the credit scorecard."""

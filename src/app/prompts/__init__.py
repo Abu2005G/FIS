@@ -1,1 +1,1 @@
-# Prompt-based Financial Intelligence Pipeline
+"""LLM pipeline: prompts, clients, output schemas."""

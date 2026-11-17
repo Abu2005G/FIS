@@ -1,17 +1,25 @@
-from fastapi import Security, HTTPException, status
+"""API-key authentication."""
+
+from __future__ import annotations
+
+import hmac
+from typing import Optional
+
+from fastapi import HTTPException, Security, status
 from fastapi.security import APIKeyHeader
-from dotenv import load_dotenv
-import os
 
-load_dotenv()
+from src.app.config import get_settings
 
-API_KEY = os.getenv("API_KEY", "my-secret-key-123")
-api_key_header = APIKeyHeader(name="X-API-Key")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != API_KEY:
+
+def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> None:
+    """Reject the request unless it carries the configured API key."""
+    expected = get_settings().api_key
+    # compare_digest avoids leaking the key through response timing
+    if not api_key or not hmac.compare_digest(api_key.encode(), expected.encode()):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid API Key"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key",
+            headers={"WWW-Authenticate": "ApiKey"},
         )
-    return api_key

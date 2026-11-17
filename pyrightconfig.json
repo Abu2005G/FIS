@@ -1,13 +1,6 @@
 {
-    "venvPath": "/Users/abdulvaseemmasood/FIS",
-    "venv": ".venv",
-    "pythonVersion": "3.11",
-    "executionEnvironments": [
-        {
-            "root": "/Users/abdulvaseemmasood/FIS",
-            "extraPaths": [
-                "/Users/abdulvaseemmasood/FIS"
-            ]
-        }
-    ]
+    "venv": "fintech_env",
+    "venvPath": ".",
+    "pythonVersion": "3.12",
+    "include": ["src", "tests", "scripts"]
 }
